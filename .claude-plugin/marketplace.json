@@ -1,0 +1,12 @@
+{
+  "name": "usage-band",
+  "owner": { "name": "kotays12" },
+  "description": "A Claude Code mod: Clawd, context window and rate limits in one line above the prompt",
+  "plugins": [
+    {
+      "name": "usage-band",
+      "source": "./",
+      "description": "Band above the prompt: Clawd at work, context window fill, session/weekly rate limits and time spent working"
+    }
+  ]
+}
