@@ -17,7 +17,7 @@ A Claude Code mod that puts your session at a glance in one line above the promp
 
   Clawd sweats when the context is past 85% or a limit is past 90%.
 - **Context window**: a bar coloured by what fills it (system prompt, tools, MCP, memory, messages), the percentage, and tokens used out of the window.
-- **Rate limits**: a ring per window (session, weekly) with the percentage and when it resets. It turns yellow at 70% and red at 90%. The figures stay live while the chat sits idle: the band asks the same server endpoint `/usage` reads, at most every 10 seconds and shared by all open sessions, so quota spent in other chats shows up too.
+- **Rate limits**: a ring per window (session, weekly) with the percentage and when it resets. It turns yellow at 70% and red at 90%. The figures stay live while the chat sits idle: open sessions share what their own responses report, read every 5 seconds, and the band asks the server endpoint `/usage` reads once a minute across all of them (longer when the server asks for a pause), so quota spent in other chats and on other devices shows up too.
 - **Time spent working**: the sum of Claude's turns, from your message to its answer. The time between messages doesn't count, and it carries over when you resume a session.
 
 The band always stays one line. When the window is narrow, the context bar gives up the room. In a terminal the bars are drawn in text.

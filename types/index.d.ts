@@ -12,6 +12,6 @@ export type Activity = 'idle' | 'code' | 'read' | 'design' | 'ops'
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-band': { snapshot: Snapshot | null; now: number; activity: Activity; doneAt: number; idleSince: number; workMs: number; turnStartedAt: number; server: Reading | null }
+    'usage-band': { snapshot: Snapshot | null; now: number; activity: Activity; doneAt: number; idleSince: number; workMs: number; turnStartedAt: number; server: Reading | null; seen: Reading | null }
   }
 }

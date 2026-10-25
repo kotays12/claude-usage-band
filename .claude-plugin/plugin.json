@@ -1,6 +1,6 @@
 {
   "name": "usage-band",
-  "version": "1.0.3",
+  "version": "1.0.8",
   "description": "Band above the prompt: Clawd at work, context window fill, session/weekly rate limits and session time",
   "types": "./types/index.d.ts",
   "author": {

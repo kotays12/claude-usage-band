@@ -218,6 +218,7 @@ test('server windows: parsed, merged at their freshest, zero past a reset', () =
     five_hour: { utilization: 61, resets_at: '2026-10-09T14:00:00.512+00:00' },
     seven_day: { utilization: 93.04, resets_at: '2026-10-14T09:00:00+00:00' },
     seven_day_opus: null,
+    seven_day_sonnet: { utilization: 0, resets_at: null },
     extra_usage: { is_enabled: false },
   })
   const server = parse(body)
@@ -231,40 +232,87 @@ test('server windows: parsed, merged at their freshest, zero past a reset', () =
     { kind: 'seven_day', percentUsed: 92, resetsAt: '2026-10-14T09:00:00Z' },
   ]
   expect(merge(own, server, NOW).map(l => l.percentUsed)).toEqual([61, 93])
-  // No reading of its own yet: the server's session and weekly windows.
+  // No reading of its own yet: the server's windows.
   expect(merge([], server, NOW).map(l => l.kind)).toEqual(['five_hour', 'seven_day'])
   // Past its reset a window stands at zero, with nothing left to count down.
   expect(merge(own, [], Date.parse('2026-10-09T14:01:00Z'))[0]).toEqual({ kind: 'five_hour', percentUsed: 0 })
 })
 
-test('an idle chat picks up what other sessions spent', async ($, on) => {
+// A session started with the server answering `respond`; how often it was asked.
+const idle = async (
+  [$, on]: Parameters<Body>,
+  respond: () => { status: number; headers?: Record<string, string>; body: unknown },
+  store: Record<string, unknown> = {},
+  usage: SessionUsage = USAGE,
+) => {
   const clock = mock.clock(on, { now: NOW })
-  mock.store(on)
+  mock.store(on, store)
   on('session.id', () => ({ value: 'session-1' }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('ui.render', ($, e) => {
     const { Box } = $.ui.resolve(e)
     return <Box key="engine" />
   })
-  on('session.usage', () => ({ value: USAGE }))
+  on('session.usage', () => ({ value: usage }))
   on('session.authorize', () => ({ value: { handle: 'h1', kind: 'bearer' } }) as never)
-  let fetched = 0
-  let session = 50
+  const asked = { count: 0 }
   on('http.fetch', () => {
-    fetched += 1
-    const text = JSON.stringify({ five_hour: { utilization: session, resets_at: '2026-10-09T14:00:00Z' } })
-    return { value: { status: 200, ok: true, headers: {}, text } } as never
+    asked.count += 1
+    const r = respond()
+    const value = { status: r.status, ok: r.status < 300, headers: r.headers ?? {}, text: JSON.stringify(r.body) }
+    return { value } as never
   })
 
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
   await clock.settle()
   const ui = await $.ui.mount({ plugin: 'usage-band', surface: 'terminal', ...BAND })
+  return { clock, ui, asked }
+}
+
+const window = (utilization: number) => ({ five_hour: { utilization, resets_at: '2026-10-09T14:00:00Z' } })
+
+test('an idle chat picks up what was spent elsewhere, asking the server once a minute', async ($, on) => {
+  let session = 50
+  const { clock, ui, asked } = await idle([$, on], () => ({ status: 200, body: window(session) }))
   expect(await ui.find({ type: 'Text', text: '50%' })).toBeDefined()
 
   session = 64
-  await clock.advance(10_000)
+  await clock.advance(30_000)
+  expect(asked.count).toBe(1)
+  await clock.advance(30_000)
   expect(await ui.find({ type: 'Text', text: '64%' })).toBeDefined()
-  // One look per ten seconds, however often the band ticks.
-  expect(fetched).toBe(2)
+  expect(asked.count).toBe(2)
+  await ui.unmount()
+})
+
+test('a busy server is left alone for as long as it asks', async ($, on) => {
+  let status = 429
+  const { clock, ui, asked } = await idle([$, on], () => ({ status, headers: { 'retry-after': '275' }, body: window(70) }))
+  expect(asked.count).toBe(1)
+
+  status = 200
+  await clock.advance(270_000)
+  expect(asked.count).toBe(1)
+  await clock.advance(10_000)
+  expect(asked.count).toBe(2)
+  expect(await ui.find({ type: 'Text', text: '70%' })).toBeDefined()
+  await ui.unmount()
+})
+
+test("another session's reading shows up without the server", async ($, on) => {
+  const seen = { limits: [{ kind: 'five_hour', percentUsed: 58, resetsAt: '2026-10-09T14:00:00Z' }], at: NOW - 1000 }
+  const { ui } = await idle([$, on], () => ({ status: 429, body: {} }), { seen })
+  expect(await ui.find({ type: 'Text', text: '58%' })).toBeDefined()
+  await ui.unmount()
+})
+
+test("a session that knows fewer windows keeps the others' in the store", async ($, on) => {
+  const seen = { limits: [{ kind: 'five_hour', percentUsed: 58, resetsAt: '2026-10-09T14:00:00Z' }], at: NOW - 1000 }
+  const weeklyOnly = { ...USAGE, rateLimits: [{ kind: 'seven_day', percentUsed: 92, resetsAt: '2026-10-14T09:00:00Z' }] }
+  const { clock, ui } = await idle([$, on], () => ({ status: 429, body: {} }), { seen }, weeklyOnly)
+  await clock.advance(5_000)
+  // Read back from the store after this session's write: the session window stays.
+  expect(await ui.find({ type: 'Text', text: '58%' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '92%' })).toBeDefined()
   await ui.unmount()
 })

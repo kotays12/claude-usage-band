@@ -16,8 +16,10 @@ const idleSince = atom({ plugin: 'usage-band', key: 'idleSince' } as const, 0)
 // Time spent working: the sum of turns, from a prompt to its answer.
 const workMs = atom({ plugin: 'usage-band', key: 'workMs' } as const, 0)
 const turnStartedAt = atom({ plugin: 'usage-band', key: 'turnStartedAt' } as const, 0)
-// The account's windows as the server last answered them.
+// The account's windows as the server last answered them, and as the
+// sessions' own responses last reported them.
 const server = atom({ plugin: 'usage-band', key: 'server' } as const, null)
+const seen = atom({ plugin: 'usage-band', key: 'seen' } as const, null)
 
 // The band looks again this often, so an idle chat still shows where things stand.
 const TICK_MS = 5 * 1000
@@ -30,14 +32,19 @@ const SLEEP_MS = 3 * 60 * 1000
 const WORK_PREFIX = 'work:'
 const WORK_KEEP = 50
 // The session's own limits come with each API response, so an idle chat would
-// show them stale while other sessions spend the same quota: the server answers
-// the account's windows as they stand now. The last reading any session got is
-// kept in the store, so sessions share it.
+// show them stale while other sessions spend the same quota. Two sources keep
+// them live, both shared through the store: what each session's own responses
+// report, free and read every tick, and the server's answer (the figures /usage
+// reads), which it rations: a minute apart, and after a refusal not before its
+// Retry-After, for every session alike.
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
-const SHARED_KEY = 'limits'
-const SERVER_MS = 10 * 1000
-// After a refusal, ask again this much later: a busy server, or no subscription.
-const BUSY_MS = 2 * 60 * 1000
+const SERVER_KEY = 'limits'
+const SEEN_KEY = 'seen'
+const UNTIL_KEY = 'limits:until'
+const SERVER_MS = 60 * 1000
+// A busy server that names no wait, and one that refused for good (no
+// subscription, a policy, offline).
+const BUSY_MS = 5 * 60 * 1000
 const OFF_MS = 15 * 60 * 1000
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const BAR_CELLS = 12
@@ -103,18 +110,30 @@ async function refresh($: EngineInterface) {
 
 let serverNextAt = 0
 
-async function poll($: EngineInterface, t: number): Promise<Reading | null> {
-  if (t < serverNextAt) return null
+// Asks the server when it is due; the answer goes to the store for everyone.
+async function fetchServer($: EngineInterface, t: number) {
+  if (t < serverNextAt) return
   serverNextAt = t + SERVER_MS
 
-  const shared = await $.store.get(SHARED_KEY)
-  if (isReading(shared) && t - shared.at < SERVER_MS) return shared
+  const until = await $.store.get(UNTIL_KEY)
+  if (typeof until === 'number' && t < until) {
+    serverNextAt = until
+    return
+  }
+  const last = await $.store.get(SERVER_KEY)
+  if (isReading(last) && t - last.at < SERVER_MS) {
+    serverNextAt = last.at + SERVER_MS
+    return
+  }
+  // Claim the turn before asking, so sessions that tick together (a reload of
+  // several) don't all ask at once.
+  await $.store.set(UNTIL_KEY, serverNextAt)
 
   try {
     const auth = await $.session.authorize()
     if (auth?.kind !== 'bearer') {
       serverNextAt = t + OFF_MS
-      return null
+      return
     }
     const res = await $.http.fetch(USAGE_URL, {
       auth: auth.handle,
@@ -122,23 +141,38 @@ async function poll($: EngineInterface, t: number): Promise<Reading | null> {
     })
     if (!res.ok) {
       const retry = Number(res.headers['retry-after']) * 1000 || 0
-      serverNextAt = t + (res.status === 429 ? Math.max(BUSY_MS, retry) : OFF_MS)
-      return null
+      serverNextAt = t + (res.status === 429 ? retry || BUSY_MS : OFF_MS)
+      await $.store.set(UNTIL_KEY, serverNextAt)
+      return
     }
-    const reading = { limits: parse(res.text), at: t }
-    await $.store.set(SHARED_KEY, reading)
-    return reading
+    await $.store.set(SERVER_KEY, { limits: parse(res.text), at: t } satisfies Reading)
   } catch {
-    // Refused by policy or offline: the session's own figures stand.
+    // Refused by policy or offline: the sessions' own figures stand.
     serverNextAt = t + OFF_MS
-    return null
   }
 }
 
-async function pollServer($: EngineInterface, t: number) {
-  const reading = await poll($, t)
-  if (reading && JSON.stringify((await read($, server))?.limits) !== JSON.stringify(reading.limits)) {
-    await update($, server, () => reading)
+// This session's own reading joins what the other sessions saw, then the band
+// takes up whatever the store holds now.
+async function share($: EngineInterface, t: number) {
+  const own = (await read($, snapshot))?.rateLimits ?? []
+  const stored = await $.store.get(SEEN_KEY)
+  const others = isReading(stored) ? stored.limits : []
+  if (own.length > 0) {
+    // In one order whichever session writes, so equal readings compare equal.
+    const limits = merge(own, others, t).sort((a, b) => a.kind.localeCompare(b.kind))
+    if (JSON.stringify(limits) !== JSON.stringify(others)) await $.store.set(SEEN_KEY, { limits, at: t } satisfies Reading)
+  }
+
+  await fetchServer($, t)
+
+  const fromServer = await $.store.get(SERVER_KEY)
+  if (isReading(fromServer) && JSON.stringify((await read($, server))?.limits) !== JSON.stringify(fromServer.limits)) {
+    await update($, server, () => fromServer)
+  }
+  const fromSessions = await $.store.get(SEEN_KEY)
+  if (isReading(fromSessions) && JSON.stringify((await read($, seen))?.limits) !== JSON.stringify(fromSessions.limits)) {
+    await update($, seen, () => fromSessions)
   }
 }
 
@@ -172,10 +206,10 @@ export const register: Register = on => {
     await update($, now, () => t)
     await update($, idleSince, prev => prev || t)
     await loadWork($)
-    void pollServer($, t)
+    void share($, t)
     void $.clock.every(TICK_MS, async () => {
       const t = await refresh($)
-      await pollServer($, t)
+      await share($, t)
       // Resets and the work clock count minutes: between moves, redraw once a minute.
       if (Math.floor(t / MINUTE) !== Math.floor((await read($, now)) / MINUTE)) await update($, now, () => t)
     })
@@ -243,7 +277,8 @@ export const register: Register = on => {
     const below = await next(e)
     const at = (await read($, now)) || (await $.clock.now())
     const { context } = snap
-    const rateLimits = merge(snap.rateLimits, (await read($, server))?.limits ?? [], at)
+    const fromServer = (await read($, server))?.limits ?? []
+    const rateLimits = merge(merge(snap.rateLimits, fromServer, at), (await read($, seen))?.limits ?? [], at)
     const ctxPercent = context.percent ?? 0
     const ctxFigure = `${compact(context.tokens ?? 0)} / ${compact(context.window)}`
     // Work so far, plus the turn running now.
