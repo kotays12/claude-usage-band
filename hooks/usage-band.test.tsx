@@ -2,6 +2,7 @@ import type { SessionUsage } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { classify } from './activity'
+import { merge, parse } from './limits'
 import { mascot } from './mascot'
 
 const BAND = {
@@ -210,4 +211,60 @@ test('another band beneath this one is still drawn, above the status row', async
     expect(await ui.find({ key: 'engine' })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('server windows: parsed, merged at their freshest, zero past a reset', () => {
+  const body = JSON.stringify({
+    five_hour: { utilization: 61, resets_at: '2026-10-09T14:00:00.512+00:00' },
+    seven_day: { utilization: 93.04, resets_at: '2026-10-14T09:00:00+00:00' },
+    seven_day_opus: null,
+    extra_usage: { is_enabled: false },
+  })
+  const server = parse(body)
+  expect(server).toEqual([
+    { kind: 'five_hour', percentUsed: 61, resetsAt: '2026-10-09T14:00:00.512+00:00' },
+    { kind: 'seven_day', percentUsed: 93, resetsAt: '2026-10-14T09:00:00+00:00' },
+  ])
+
+  const own = [
+    { kind: 'five_hour', percentUsed: 45, resetsAt: '2026-10-09T14:00:00Z' },
+    { kind: 'seven_day', percentUsed: 92, resetsAt: '2026-10-14T09:00:00Z' },
+  ]
+  expect(merge(own, server, NOW).map(l => l.percentUsed)).toEqual([61, 93])
+  // No reading of its own yet: the server's session and weekly windows.
+  expect(merge([], server, NOW).map(l => l.kind)).toEqual(['five_hour', 'seven_day'])
+  // Past its reset a window stands at zero, with nothing left to count down.
+  expect(merge(own, [], Date.parse('2026-10-09T14:01:00Z'))[0]).toEqual({ kind: 'five_hour', percentUsed: 0 })
+})
+
+test('an idle chat picks up what other sessions spent', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  on('session.id', () => ({ value: 'session-1' }) as never)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('session.usage', () => ({ value: USAGE }))
+  on('session.authorize', () => ({ value: { handle: 'h1', kind: 'bearer' } }) as never)
+  let fetched = 0
+  let session = 50
+  on('http.fetch', () => {
+    fetched += 1
+    const text = JSON.stringify({ five_hour: { utilization: session, resets_at: '2026-10-09T14:00:00Z' } })
+    return { value: { status: 200, ok: true, headers: {}, text } } as never
+  })
+
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'usage-band', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: '50%' })).toBeDefined()
+
+  session = 64
+  await clock.advance(10_000)
+  expect(await ui.find({ type: 'Text', text: '64%' })).toBeDefined()
+  // One look per ten seconds, however often the band ticks.
+  expect(fetched).toBe(2)
+  await ui.unmount()
 })

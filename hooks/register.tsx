@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Segment } from '../types'
+import type { Reading, Segment } from '../types'
 import { classify } from './activity'
+import { isReading, merge, parse } from './limits'
 import { ALT, mascot } from './mascot'
 import type { Pose } from './mascot'
 import { hourglass, lane, level, ring } from './scene'
@@ -15,8 +16,12 @@ const idleSince = atom({ plugin: 'usage-band', key: 'idleSince' } as const, 0)
 // Time spent working: the sum of turns, from a prompt to its answer.
 const workMs = atom({ plugin: 'usage-band', key: 'workMs' } as const, 0)
 const turnStartedAt = atom({ plugin: 'usage-band', key: 'turnStartedAt' } as const, 0)
+// The account's windows as the server last answered them.
+const server = atom({ plugin: 'usage-band', key: 'server' } as const, null)
 
-const TICK_MS = 30 * 1000
+// The band looks again this often, so an idle chat still shows where things stand.
+const TICK_MS = 5 * 1000
+const MINUTE = 60 * 1000
 // Clawd cheers this long after a turn, and dozes off after this long idle.
 const DONE_MS = 2400
 const SLEEP_MS = 3 * 60 * 1000
@@ -24,6 +29,16 @@ const SLEEP_MS = 3 * 60 * 1000
 // picks up where it left off; only the most recent sessions are kept.
 const WORK_PREFIX = 'work:'
 const WORK_KEEP = 50
+// The session's own limits come with each API response, so an idle chat would
+// show them stale while other sessions spend the same quota: the server answers
+// the account's windows as they stand now. The last reading any session got is
+// kept in the store, so sessions share it.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const SHARED_KEY = 'limits'
+const SERVER_MS = 10 * 1000
+// After a refusal, ask again this much later: a busy server, or no subscription.
+const BUSY_MS = 2 * 60 * 1000
+const OFF_MS = 15 * 60 * 1000
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const BAR_CELLS = 12
 
@@ -76,12 +91,55 @@ async function refresh($: EngineInterface) {
     .filter(c => c.kind === 'used' && c.tokens > 0)
     .map(c => ({ name: c.name, tokens: c.tokens }))
 
-  await update($, snapshot, () => ({
+  const next = {
     context: { tokens: u.context.tokens, window: u.context.window, percent: u.context.percent, segments },
     rateLimits: u.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })),
     startedAt: u.startedAt,
-  }))
-  await update($, now, () => t)
+  }
+  // A write redraws the band: only when a figure moved.
+  if (JSON.stringify(await read($, snapshot)) !== JSON.stringify(next)) await update($, snapshot, () => next)
+  return t
+}
+
+let serverNextAt = 0
+
+async function poll($: EngineInterface, t: number): Promise<Reading | null> {
+  if (t < serverNextAt) return null
+  serverNextAt = t + SERVER_MS
+
+  const shared = await $.store.get(SHARED_KEY)
+  if (isReading(shared) && t - shared.at < SERVER_MS) return shared
+
+  try {
+    const auth = await $.session.authorize()
+    if (auth?.kind !== 'bearer') {
+      serverNextAt = t + OFF_MS
+      return null
+    }
+    const res = await $.http.fetch(USAGE_URL, {
+      auth: auth.handle,
+      headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
+    })
+    if (!res.ok) {
+      const retry = Number(res.headers['retry-after']) * 1000 || 0
+      serverNextAt = t + (res.status === 429 ? Math.max(BUSY_MS, retry) : OFF_MS)
+      return null
+    }
+    const reading = { limits: parse(res.text), at: t }
+    await $.store.set(SHARED_KEY, reading)
+    return reading
+  } catch {
+    // Refused by policy or offline: the session's own figures stand.
+    serverNextAt = t + OFF_MS
+    return null
+  }
+}
+
+async function pollServer($: EngineInterface, t: number) {
+  const reading = await poll($, t)
+  if (reading && JSON.stringify((await read($, server))?.limits) !== JSON.stringify(reading.limits)) {
+    await update($, server, () => reading)
+  }
 }
 
 type WorkEntry = { ms: number; at: number }
@@ -110,20 +168,24 @@ async function saveWork($: EngineInterface, ms: number, at: number) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await refresh($)
-    const t = await read($, now)
+    const t = await refresh($)
+    await update($, now, () => t)
     await update($, idleSince, prev => prev || t)
     await loadWork($)
+    void pollServer($, t)
     void $.clock.every(TICK_MS, async () => {
-      const t = await $.clock.now()
-      await update($, now, () => t)
+      const t = await refresh($)
+      await pollServer($, t)
+      // Resets and the work clock count minutes: between moves, redraw once a minute.
+      if (Math.floor(t / MINUTE) !== Math.floor((await read($, now)) / MINUTE)) await update($, now, () => t)
     })
 
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
-    await refresh($)
+    const t = await refresh($)
+    await update($, now, () => t)
 
     return next(e)
   })
@@ -180,7 +242,8 @@ export const register: Register = on => {
     // Other mods' bands sit beneath this one; draw theirs above ours, the status row stays last.
     const below = await next(e)
     const at = (await read($, now)) || (await $.clock.now())
-    const { context, rateLimits } = snap
+    const { context } = snap
+    const rateLimits = merge(snap.rateLimits, (await read($, server))?.limits ?? [], at)
     const ctxPercent = context.percent ?? 0
     const ctxFigure = `${compact(context.tokens ?? 0)} / ${compact(context.window)}`
     // Work so far, plus the turn running now.
